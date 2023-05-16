@@ -1,155 +1,180 @@
-from flask import Flask, render_template, request, Markup
+import os
+import shutil
+import time
 import numpy as np
 import pandas as pd
-from utils.fertilizer import fertilizer_dic
+import tensorflow as tf
+from keras.preprocessing.image import ImageDataGenerator
+from tensorflow.python.keras.models import load_model
 import requests
-import config
-import pickle
-import io
-#import torch
-#from torchvision import transforms
-# ==============================================================================================
+from flask import Flask, render_template, request, redirect, flash, send_from_directory
+from werkzeug.utils import secure_filename
+from flask_apscheduler import APScheduler
 
-# -------------------------LOADING THE TRAINED MODELS -----------------------------------------------
+from data import disease_map, details_map
 
-# Loading crop recommendation model
+# Download Model File
+if not os.path.exists('model.h5'):
+    print("Downloading model...")
+    url = "https://drive.google.com/uc?id=1JNggWQ9OJFYnQpbsFXMrVu-E-sR3VnCu&confirm=t"
+    r = requests.get(url, stream=True)
+    with open('./model.h5', 'wb') as f:
+        for chunk in r.iter_content(chunk_size=1024):
+            if chunk:
+                f.write(chunk)
+    print("Finished downloading model.")
 
-crop_recommendation_model_path = 'Model/RandomForest.pkl'
-crop_recommendation_model = pickle.load(
-    open(crop_recommendation_model_path, 'rb'))
+# Load model from downloaded model file
+model = load_model('model.h5')
 
-# =========================================================================================
+# Create folder to save images temporarily
+if not os.path.exists('./static/test'):
+        os.makedirs('./static/test')
 
-# Custom functions for calculations
+def predict(test_dir):
+    test_img = [f for f in os.listdir(os.path.join(test_dir)) if not f.startswith(".")]
+    test_df = pd.DataFrame({'Image': test_img})
+    
+    test_gen = ImageDataGenerator(rescale=1./255)
+
+    test_generator = test_gen.flow_from_dataframe(
+        test_df, 
+        test_dir, 
+        x_col = 'Image',
+        y_col = None,
+        class_mode = None,
+        target_size = (256, 256),
+        batch_size = 20,
+        shuffle = False
+    )
+    predict = model.predict(test_generator, steps = np.ceil(test_generator.samples/20))
+    test_df['Label'] = np.argmax(predict, axis = -1) # axis = -1 --> To compute the max element index within list of lists
+    test_df['Label'] = test_df['Label'].replace(disease_map)
+
+    prediction_dict = {}
+    for value in test_df.to_dict('index').values():
+        image_name = value['Image']
+        image_prediction = value['Label']
+        prediction_dict[image_name] = {}
+        prediction_dict[image_name]['prediction'] = image_prediction
+        prediction_dict[image_name]['description'] = details_map[image_prediction][0]
+        prediction_dict[image_name]['symptoms'] = details_map[image_prediction][1]
+        prediction_dict[image_name]['source'] = details_map[image_prediction][2]
+    return prediction_dict
 
 
-def weather_fetch(city_name):
-    """
-    Fetch and returns the temperature and humidity of a city
-    :params: city_name
-    :return: temperature, humidity
-    """
-    api_key = config.weather_api_key
-    base_url = "http://api.openweathermap.org/data/2.5/weather?"
-
-    complete_url = base_url + "appid=" + api_key + "&q=" + city_name
-    response = requests.get(complete_url)
-    x = response.json()
-
-    if x["cod"] != "404":
-        y = x["main"]
-
-        temperature = round((y["temp"] - 273.15), 2)
-        humidity = y["humidity"]
-        return temperature, humidity
-    else:
-        return None
-        
-# ===============================================================================================
-# ------------------------------------ FLASK APP -------------------------------------------------
-
-
+# Create an app
 app = Flask(__name__)
-@ app.route('/')
-def home():
-    title = 'Croft - Home'
-    return render_template('index.html', title=title)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 # maximum upload size is 50 MB
+app.secret_key = "agentcrop"
+ALLOWED_EXTENSIONS = {'png', 'jpeg', 'jpg'}
+folder_num = 0
+folders_list = []
 
-# render crop recommendation form page
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+# initialize scheduler
+scheduler = APScheduler()
+scheduler.api_enabled = True
+scheduler.init_app(app)
 
-@ app.route('/crop-recommend')
-def crop_recommend():
-    title = 'Croft - Crop Recommendation'
-    return render_template('crop.html', title=title)
+# Adding Interval Job to delete folder
+@scheduler.task('interval', id='clean', seconds=1800, misfire_grace_time=900)
+def clean():
+    global folders_list
+    try:
+        for folder in folders_list:
+            if (time.time() - os.stat(folder).st_ctime) / 3600 > 1:
+                shutil.rmtree(folder)
+                folders_list.remove(folder)
+                print("\n***************Removed Folder '{}'***************\n".format(folder))
+    except:
+        flash("Something Went Wrong! couldn't delete data!")
 
-# render fertilizer recommendation form page
+scheduler.start()
 
+@app.route('/', methods=['GET', 'POST'])
 
-@ app.route('/fertilizer')
-def fertilizer_recommendation():
-    title = 'Croft - Fertilizer Suggestion'
-
-    return render_template('fertilizer.html', title=title)
-
-# ===============================================================================================
-
-# RENDER PREDICTION PAGES
-
-# render crop recommendation result page
-
-
-@ app.route('/crop-predict', methods=['POST'])
-def crop_prediction():
-    title = 'Harvestify - Crop Recommendation'
-
+def get_disease():
+    global folder_num
+    global folders_list
     if request.method == 'POST':
-        N = int(request.form['nitrogen'])
-        P = int(request.form['phosphorous'])
-        K = int(request.form['pottasium'])
-        ph = float(request.form['ph'])
-        rainfall = float(request.form['rainfall'])
+        if folder_num >= 1000000:
+            folder_num = 0
+        # check if the post request has the file part
+        if 'hiddenfiles' not in request.files:
+            flash('No files part!')
+            return redirect(request.url)
+        # Create a new folder for every new file uploaded,
+        # so that concurrency can be maintained
+        files = request.files.getlist('hiddenfiles')
+        app.config['UPLOAD_FOLDER'] = "./static/test"
+        app.config['UPLOAD_FOLDER'] = app.config['UPLOAD_FOLDER'] + '/predict_' + str(folder_num).rjust(6, "0")
+        if not os.path.exists(app.config['UPLOAD_FOLDER']):
+            os.makedirs(app.config['UPLOAD_FOLDER'])
+            folders_list.append(app.config['UPLOAD_FOLDER'])
+            folder_num += 1
+        for file in files:
+            if file.filename == '':
+                flash('No Files are Selected!')
+                return redirect(request.url)
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            else:
+                flash("Invalid file type! Only PNG, JPEG/JPG files are supported.")
+                return redirect('/')
+        try:
+            if len(os.listdir(app.config['UPLOAD_FOLDER'])) > 0:
+                diseases = predict(app.config['UPLOAD_FOLDER'])
+                return render_template('show_prediction.html',
+                folder = app.config['UPLOAD_FOLDER'],
+                predictions = diseases)
+        except:
+            return redirect('/')
+        
+    return render_template('index.html')
 
-        # state = request.form.get("stt")
-        city = request.form.get("city")
+@app.route('/favicon.ico')
 
-        if weather_fetch(city) != None:
-            temperature, humidity = weather_fetch(city)
-            data = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
-            my_prediction = crop_recommendation_model.predict(data)
-            final_prediction = my_prediction[0]
+def favicon(): 
+    return send_from_directory(os.path.join(app.root_path, 'static'), 'Agent-Crop-Icon.png')
 
-            return render_template('crop-result.html', prediction=final_prediction, title=title)
+#API requests are handled here
+@app.route('/api/predict', methods=['POST'])
 
+def api_predict():
+    global folder_num
+    global folders_list
+    if folder_num >= 1000000:
+            folder_num = 0
+    # check if the post request has the file part
+    if 'files' not in request.files:
+        return {"Error": "No files part found."}
+    # Create a new folder for every new file uploaded,
+    # so that concurrency can be maintained
+    files = request.files.getlist('files')
+    app.config['UPLOAD_FOLDER'] = "./static/test"
+    app.config['UPLOAD_FOLDER'] = app.config['UPLOAD_FOLDER'] + '/predict_' + str(folder_num).rjust(6, "0")
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.makedirs(app.config['UPLOAD_FOLDER'])
+        folders_list.append(app.config['UPLOAD_FOLDER'])
+        folder_num += 1
+    for file in files:
+        if file.filename == '':
+            return {"Error": "No Files are Selected!"}
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
         else:
+            return {"Error": "Invalid file type! Only PNG, JPEG/JPG files are supported."}
+    try:
+        if len(os.listdir(app.config['UPLOAD_FOLDER'])) > 0:
+            diseases = predict(app.config['UPLOAD_FOLDER'])
+            return diseases
+    except:
+        return {"Error": "Something Went Wrong!"}
 
-            return render_template('try_again.html', title=title)
-
-# render fertilizer recommendation result page
-
-
-@ app.route('/fertilizer-predict', methods=['POST'])
-def fert_recommend():
-    title = 'Harvestify - Fertilizer Suggestion'
-
-    crop_name = str(request.form['cropname'])
-    N = int(request.form['nitrogen'])
-    P = int(request.form['phosphorous'])
-    K = int(request.form['pottasium'])
-    # ph = float(request.form['ph'])
-
-    df = pd.read_csv('data set/fertilizer.csv')
-
-    nr = df[df['Crop'] == crop_name]['N'].iloc[0]
-    pr = df[df['Crop'] == crop_name]['P'].iloc[0]
-    kr = df[df['Crop'] == crop_name]['K'].iloc[0]
-
-    n = nr - N
-    p = pr - P
-    k = kr - K
-    temp = {abs(n): "N", abs(p): "P", abs(k): "K"}
-    max_value = temp[max(temp.keys())]
-    if max_value == "N":
-        if n < 0:
-            key = 'NHigh'
-        else:
-            key = "Nlow"
-    elif max_value == "P":
-        if p < 0:
-            key = 'PHigh'
-        else:
-            key = "Plow"
-    else:
-        if k < 0:
-            key = 'KHigh'
-        else:
-            key = "Klow"
-
-    response = Markup(str(fertilizer_dic[key]))
-
-    return render_template('fertilizer-result.html', recommendation=response, title=title)
-
-# ===============================================================================================
-
-if __name__ == '__main__':
-    app.run(debug=False)
+if __name__ == "__main__":
+    app.run(debug=True, port=8000)
